@@ -3,27 +3,37 @@ import tempfile
 import configparser
 import json
 import lz4.block
-import argparse
-import sys
-import os
-from typing import List, Dict, Optional
+from typing import List, Dict
+
+_MAGIC = b"mozLz40\0"
 
 
-def compress(src, dest):
-    with open(src, "rb") as file:
-        compressed = lz4.block.compress(file.read())
-        output_file = b"mozLz40\0" + compressed
-    with open(dest, "wb") as file:
-        file.write(output_file)
+def compress(src, dest) -> None:
+    data = Path(src).read_bytes()
+    output = _MAGIC + lz4.block.compress(data)
+    dest_path = Path(dest)
+    tmp = dest_path.parent / (dest_path.name + ".tmp")
+    try:
+        tmp.write_bytes(output)
+        tmp.replace(dest_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
-def decompress(src, dest):
-    with open(src, "rb") as file:
-        if file.read(8) != b"mozLz40\0":
-            raise ValueError("Invalid magic number")
-        string_to_write = lz4.block.decompress(file.read())
-    with open(dest, "wb") as file:
-        file.write(string_to_write)
+def decompress(src, dest) -> None:
+    data = Path(src).read_bytes()
+    if len(data) < len(_MAGIC) or data[:len(_MAGIC)] != _MAGIC:
+        raise ValueError(f"Not a valid mozLz4 file: {src}")
+    decompressed = lz4.block.decompress(data[len(_MAGIC):])
+    dest_path = Path(dest)
+    tmp = dest_path.parent / (dest_path.name + ".tmp")
+    try:
+        tmp.write_bytes(decompressed)
+        tmp.replace(dest_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def get_firefox_path() -> Path:
@@ -34,11 +44,14 @@ def get_firefox_path() -> Path:
 def list_profiles() -> List[Dict[str, str]]:
     """Parse `profiles.ini` and return a list of profiles as dicts with `name` and `path`.
 
-    The returned `path` is absolute.
+    The returned `path` is absolute. Returns empty list if profiles.ini does not exist.
     """
     firefox_path = get_firefox_path()
+    ini_path = firefox_path / "profiles.ini"
+    if not ini_path.exists():
+        return []
     config = configparser.ConfigParser()
-    config.read(firefox_path / "profiles.ini")
+    config.read(ini_path)
     profiles: List[Dict[str, str]] = []
     for section in config.sections():
         if not config.has_option(section, "Path"):
@@ -67,79 +80,92 @@ def get_profile_path_by_index(index: int) -> Path:
 def get_available_themes(profile_path: Path) -> List[Dict]:
     """Return the list of theme addon objects from `extensions.json` for the given profile.
 
-    If `extensions.json` does not exist, returns an empty list.
+    Returns empty list if extensions.json does not exist.
+    Raises ValueError on malformed JSON.
     """
     extensions_file = Path(profile_path) / "extensions.json"
-    themes: List[Dict] = []
-    try:
-        with open(extensions_file, "r") as fh:
-            data = json.load(fh)
-            for addon in data.get("addons", []):
-                if addon.get("type") == "theme":
-                    themes.append(addon)
-    except FileNotFoundError:
+    if not extensions_file.exists():
         return []
-    return themes
+    try:
+        data = json.loads(extensions_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Could not parse extensions.json: {exc}") from exc
+    return [addon for addon in data.get("addons", []) if addon.get("type") == "theme"]
 
 
 def set_active_theme_in_prefs(profile_path: Path, theme_id: str) -> None:
     """Set `extensions.activeThemeID` in `prefs.js` to `theme_id`.
 
-    If the preference line does not exist, append it.
+    If the preference line does not exist, append it. Writes atomically.
     """
     prefs_js_path = Path(profile_path) / "prefs.js"
-    new_content = ""
+    if not prefs_js_path.exists():
+        raise FileNotFoundError(f"prefs.js not found: {prefs_js_path}")
+    lines = prefs_js_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    new_lines = []
     found = False
-    with open(prefs_js_path, "r") as fh:
-        for line in fh:
-            if 'user_pref("extensions.activeThemeID", ' in line:
-                new_content += f'user_pref("extensions.activeThemeID", "{theme_id}");\n'
-                found = True
-            else:
-                new_content += line
+    for line in lines:
+        if 'user_pref("extensions.activeThemeID", ' in line:
+            new_lines.append(f'user_pref("extensions.activeThemeID", "{theme_id}");\n')
+            found = True
+        else:
+            new_lines.append(line)
     if not found:
-        new_content += f'user_pref("extensions.activeThemeID", "{theme_id}");\n'
-    with open(prefs_js_path, "w") as fh:
-        fh.write(new_content)
+        new_lines.append(f'user_pref("extensions.activeThemeID", "{theme_id}");\n')
+    content = "".join(new_lines)
+    tmp = prefs_js_path.parent / (prefs_js_path.name + ".tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(prefs_js_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def set_active_theme_in_extensions(profile_path: Path, theme_id: str) -> None:
-    """Update `extensions.json` to enable the chosen theme and disable others."""
+    """Update `extensions.json` to enable the chosen theme and disable others.
+
+    Writes atomically.
+    """
     extension_json_path = Path(profile_path) / "extensions.json"
-    with open(extension_json_path, "r") as fh:
-        data = json.load(fh)
+    if not extension_json_path.exists():
+        raise FileNotFoundError(f"extensions.json not found: {extension_json_path}")
+    data = json.loads(extension_json_path.read_text(encoding="utf-8"))
     for addon in data.get("addons", []):
         if addon.get("type") == "theme":
-            if addon.get("id") == theme_id:
-                addon["userDisabled"] = False
-                addon["active"] = True
-            else:
-                addon["userDisabled"] = True
-                addon["active"] = False
-    with open(extension_json_path, "w") as fh:
-        json.dump(data, fh)
+            active = addon.get("id") == theme_id
+            addon["userDisabled"] = not active
+            addon["active"] = active
+    content = json.dumps(data)
+    tmp = extension_json_path.parent / (extension_json_path.name + ".tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(extension_json_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def set_active_theme_in_addon_startup(profile_path: Path, theme_id: str) -> None:
     """Update `addonStartup.json.lz4` enabling only `theme_id`.
 
-    This function will decompress to a temp file, modify it, then recompress.
+    Decompresses to a unique temp file, modifies, then recompresses atomically.
     """
-    temp_path = Path(tempfile.gettempdir()) / "addonStartup.json"
-    lz4_src = Path(profile_path) / "addonStartup.json.lz4"
-    # decompress to temp file
-    decompress(lz4_src, temp_path)
-    with open(temp_path, "r") as fh:
-        data = json.load(fh)
-    addons = data.get("app-profile", {}).get("addons", {})
-    for aid, addon in list(addons.items()):
-        if addon.get("type") == "theme":
-            addon["enabled"] = (aid == theme_id)
-    with open(temp_path, "w") as fh:
-        json.dump(data, fh)
-    # recompress back to profile
-    compress(temp_path, lz4_src)
-
+    lz4_path = Path(profile_path) / "addonStartup.json.lz4"
+    if not lz4_path.exists():
+        raise FileNotFoundError(f"addonStartup.json.lz4 not found: {lz4_path}")
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp_fh:
+        tmp_path = Path(tmp_fh.name)
+    try:
+        decompress(lz4_path, tmp_path)
+        data = json.loads(tmp_path.read_text(encoding="utf-8"))
+        for aid, addon in data.get("app-profile", {}).get("addons", {}).items():
+            if addon.get("type") == "theme":
+                addon["enabled"] = (aid == theme_id)
+        tmp_path.write_text(json.dumps(data), encoding="utf-8")
+        compress(tmp_path, lz4_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 __all__ = [
@@ -151,5 +177,5 @@ __all__ = [
     "get_available_themes",
     "set_active_theme_in_prefs",
     "set_active_theme_in_extensions",
-    "set_active_theme_in_addon_startup"
+    "set_active_theme_in_addon_startup",
 ]

@@ -13,9 +13,9 @@ end
 
 set -l tag $argv[1]
 set -l msg (string join ' ' $argv[2..-1])
-set -l version (string replace -r '^v' '' $tag)
+set -l pkg_version (string replace -r '^v' '' $tag)
 
-echo "Updating pyproject.toml to version $version"
+echo "Updating pyproject.toml to version $pkg_version"
 
 if not test -f pyproject.toml
     echo "pyproject.toml not found in $(pwd)"
@@ -23,7 +23,7 @@ if not test -f pyproject.toml
 end
 
 # Replace the `version = "..."` line within the [project] section
-awk -v ver="$version" '
+awk -v ver="$pkg_version" '
     BEGIN {inproj=0}
     /^\[project\]/ {print; inproj=1; next}
     inproj && /^\[/ {inproj=0}

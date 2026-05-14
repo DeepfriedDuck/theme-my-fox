@@ -1,6 +1,6 @@
 [project]
 name = "theme-my-fox"
-version = "4.3.3"
+version = "4.4.0"
 description = "Firefox theme helper library"
 authors = [
     {name = "Deepfriedduck", email = "deepfriedduck.opensourceapis@gmail.com"},
@@ -14,6 +14,14 @@ license = { file = "LICENSE" }
 [tool.pdm]
 distribution = false
 
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
 [build-system]
 requires = ["pdm-backend"]
 build-backend = "pdm.backend"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
